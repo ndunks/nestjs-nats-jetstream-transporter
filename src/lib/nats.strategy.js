@@ -5,7 +5,6 @@ const tslib_1 = require("tslib");
 const microservices_1 = require("@nestjs/microservices");
 const common_1 = require("@nestjs/common");
 const nats_1 = require("nats");
-// import { ConsumerOptsBuilderImpl } from "nats/lib/jetstream/types";
 const rxjs_1 = require("rxjs");
 const nats_context_1 = require("./nats.context");
 const nats_constants_1 = require("./nats.constants");
@@ -136,45 +135,43 @@ class NatsTransportStrategy extends microservices_1.Server {
         return tslib_1.__awaiter(this, void 0, void 0, function* () {
             const eventHandlers = [...this.messageHandlers.entries()].filter(([, handler]) => handler.isEventHandler);
             for (const [pattern, handler] of eventHandlers) {
-                let defaultConsumerName = `subscriber-${pattern}`;
-                // Need to access config options that is not exposed by the ConsumerOptsBuilder interface
-                // https://github.com/nats-io/nats.deno/blob/main/nats-base-client/jsconsumeropts.ts#L55
-                //const consumerOptions = consumerOpts() as ConsumerOptsBuilderImpl;
-                const consumerConfig = { name: `subscriber-${pattern}`, ack_policy: nats_1.AckPolicy.Explicit, inactive_threshold: nats_1.nanos(2 * 60 * 1000), replay_policy: nats_1.ReplayPolicy.Original };
+                // Build consumer options using ConsumerOptsBuilder (nats 2.4.x API)
+                const consumerOptions = nats_1.consumerOpts();
+                consumerOptions.ackExplicit();
+                consumerOptions.replayOriginal();
+                consumerOptions.manualAck();
+                consumerOptions.deliverAll();
+                // Apply user-supplied consumer config overrides
+                const consumerConfig = {
+                    ack_policy: nats_1.AckPolicy.Explicit,
+                    replay_policy: nats_1.ReplayPolicy.Original,
+                };
                 if (this.options.consumer) {
                     this.options.consumer(consumerConfig);
                 }
+                // Map durable_name from config to the builder
                 if (consumerConfig.durable_name) {
-                    consumerConfig.durable_name = this.createDurableName(consumerConfig.durable_name, pattern);
-                    defaultConsumerName = consumerConfig.durable_name;
-                    consumerConfig.name = defaultConsumerName;
+                    const durableName = this.createDurableName(consumerConfig.durable_name, pattern);
+                    consumerOptions.durable(durableName);
                 }
+                else {
+                    // Default ephemeral durable name derived from pattern
+                    consumerOptions.durable(this.createDurableName("subscriber", pattern));
+                }
+                // Apply queue group if configured
+                if (this.options.queue) {
+                    consumerOptions.queue(this.options.queue);
+                }
+                consumerOptions.callback((error, message) => {
+                    if (error) {
+                        return this.logger.error(error.message, error.stack);
+                    }
+                    if (message) {
+                        return this.handleJetStreamMessage(message, handler);
+                    }
+                });
                 try {
-                    // force to create consumer
-                    let consumerInfo;
-                    try {
-                        consumerInfo = yield jsm.consumers.info(pattern, defaultConsumerName);
-                    }
-                    catch (err) {
-                        consumerInfo = null;
-                    }
-                    if (!consumerInfo) {
-                        //create consumer based event pattern
-                        consumerInfo = yield jsm.consumers.add(pattern, consumerConfig);
-                        //newConsumerInfo.
-                    }
-                    else {
-                        //update consumer absed event pattern
-                        // cannot update replay policy
-                        delete consumerConfig.replay_policy;
-                        consumerInfo = yield jsm.consumers.update(pattern, defaultConsumerName, consumerConfig);
-                    }
-                    const eventConsumer = client.consumers.get(consumerInfo.stream_name, consumerInfo.name);
-                    (yield eventConsumer).consume({ callback: (message) => {
-                            if (message) {
-                                return this.handleJetStreamMessage(message, handler);
-                            }
-                        } });
+                    yield client.subscribe(pattern, consumerOptions);
                     this.logger.log(`Subscribed to ${pattern} events`);
                 }
                 catch (error) {
@@ -183,51 +180,6 @@ class NatsTransportStrategy extends microservices_1.Server {
                     }
                     throw error;
                 }
-                /*if (this.options.consumer?.name) {
-                  defaultConsumerName = consumerOptions.config.name;
-                }
-          
-                if (this.options.consumer?) {
-                  consumerOptions.durable(
-                    this.createDurableName(consumerOptions.config.durable_name, pattern)
-                  );
-                  defaultConsumerName = this.createDurableName(consumerOptions.config.durable_name, pattern);
-                }
-          
-          
-                consumerOptions.callback((error, message) => {
-                  if (error) {
-                    return this.logger.error(error.message, error.stack);
-                  }
-          
-                  if (message) {
-                    return this.handleJetStreamMessage(message, handler);
-                  }
-                });
-          
-                consumerOptions.deliverTo(createInbox());
-          
-                consumerOptions.manualAck();
-                try {
-                  // force to create consumer
-                  if (defaultConsumerName) {
-                    const consumerInfo: ConsumerInfo = await jsm.consumers.info(pattern, defaultConsumerName);
-                    if (!consumerInfo) {
-                      //create consumer based event patter
-                      jsm.consumers.add(pattern, consumerOptions);
-                    }
-                  }
-                  
-                  await client.subscribe(pattern, consumerOptions);
-          
-                  this.logger.log(`Subscribed to ${pattern} events`);
-                } catch (error: Error) {
-                  if (error.message === "no stream matches subject") {
-                    throw new Error(`Cannot find stream with the ${pattern} event pattern`);
-                  }
-          
-                  throw error;
-                }*/
             }
         });
     }
@@ -253,7 +205,8 @@ class NatsTransportStrategy extends microservices_1.Server {
         return tslib_1.__awaiter(this, void 0, void 0, function* () {
             try {
                 const stream = yield manager.streams.info(config.name);
-                const updated = yield manager.streams.update(config.name, Object.assign(Object.assign({}, stream.config), config));
+                // nats 2.4.x: streams.update takes only the merged StreamConfig (no stream-name as first arg)
+                const updated = yield manager.streams.update(Object.assign(Object.assign({}, stream.config), config));
                 return updated;
             }
             catch (error) {
