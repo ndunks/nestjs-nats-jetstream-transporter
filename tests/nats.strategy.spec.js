@@ -1,11 +1,11 @@
 "use strict";
 
 /**
- * Compatibility tests for NatsTransportStrategy with nats@2.4.x
+ * Compatibility tests for NatsTransportStrategy with nats@2.29.3
  *
- * These tests verify that the library correctly uses the nats 2.4.x API:
- *  - consumerOpts() builder (not the new simplified consumers.get().consume())
- *  - streams.update(cfg) with one argument (not two)
+ * These tests verify that the library correctly uses the nats 2.29.3 API:
+ *  - consumerOpts() builder and push subscriptions
+ *  - streams.update(name, cfg)
  *  - ConsumerConfig plain-object fields (durable_name, deliver_group, etc.)
  *  - All status.type strings from the Events / DebugEvents enums
  */
@@ -13,30 +13,15 @@
 // ---------------------------------------------------------------------------
 // Module-level mock for nats — must be hoisted before any require()
 // consumerOpts is exported as a non-configurable/non-writable property in
-// nats@2.4.x so jest.spyOn() cannot patch it; we mock the whole module instead.
+// nats@2.29.3 so jest.spyOn() cannot patch it; we mock the whole module instead.
 // ---------------------------------------------------------------------------
 const realNats = jest.requireActual("nats");
-
-// Track calls made on the consumerOpts builder across tests
-let _builderCalls = {};
-let _mockSubscribeResult = Promise.resolve({ unsubscribe: jest.fn() });
 
 jest.mock("nats", () => {
   const actual = jest.requireActual("nats");
   return {
     ...actual,
-    consumerOpts: jest.fn(() => {
-      _builderCalls = {};
-      const builder = new Proxy({}, {
-        get(_, method) {
-          return (...args) => {
-            _builderCalls[method] = args.length === 0 ? true : args.length === 1 ? args[0] : args;
-            return builder;
-          };
-        },
-      });
-      return builder;
-    }),
+    consumerOpts: jest.fn((options) => actual.consumerOpts(options)),
   };
 });
 
@@ -45,25 +30,8 @@ const { NACK, TERM } = require("../src/lib/nats.constants");
 const nats = require("nats");
 
 // ---------------------------------------------------------------------------
-// Helpers – build lightweight fakes that mirror nats@2.4.x shapes
+// Helpers – build lightweight fakes for connection and manager APIs
 // ---------------------------------------------------------------------------
-
-function makeConsumerOpts() {
-  const calls = {};
-  const builder = new Proxy(
-    {},
-    {
-      get(_, method) {
-        return (...args) => {
-          calls[method] = args.length === 0 ? true : args.length === 1 ? args[0] : args;
-          return builder; // allow chaining
-        };
-      },
-    }
-  );
-  builder._calls = calls;
-  return builder;
-}
 
 function makeJsMsg(overrides = {}) {
   return {
@@ -90,7 +58,6 @@ function makeJetStreamClient(opts = {}) {
   return {
     subscribe: jest.fn().mockResolvedValue(makeJetStreamSubscription()),
     publish: jest.fn().mockResolvedValue(undefined),
-    // consumers.get() must NOT be called in nats 2.4.x — keep it absent
     ...opts,
   };
 }
@@ -101,11 +68,9 @@ function makeJetStreamManager(opts = {}) {
     consumers: {
       info: jest.fn().mockRejectedValue(new Error("consumer not found")),
       add: jest.fn().mockResolvedValue(consumerInfo),
-      // update() does NOT exist on ConsumerAPI in nats 2.4.x — keep it absent
     },
     streams: {
       info: jest.fn().mockResolvedValue({ config: { name: "my-stream", subjects: [] } }),
-      // nats 2.4.x: update(cfg) — single argument
       update: jest.fn().mockResolvedValue({ config: {} }),
       add: jest.fn().mockResolvedValue({ config: {} }),
     },
@@ -198,26 +163,20 @@ describe("NatsTransportStrategy — JetStream factory methods", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. NatsTransportStrategy — subscribeToEventPatterns (nats 2.4.x API)
+// 4. NatsTransportStrategy — subscribeToEventPatterns
 // ---------------------------------------------------------------------------
 
 describe("NatsTransportStrategy — subscribeToEventPatterns", () => {
   let strategy;
   let jsClient;
   let jsm;
-  let consumerOptsBuilder;
-
   beforeEach(() => {
-    // Spy on nats.consumerOpts to intercept the builder
-    consumerOptsBuilder = makeConsumerOpts();
-    jest.spyOn(nats, "consumerOpts").mockReturnValue(consumerOptsBuilder);
+    nats.consumerOpts.mockClear();
 
     jsClient = makeJetStreamClient();
     jsm = makeJetStreamManager();
     strategy = new NatsTransportStrategy();
   });
-
-  afterEach(() => jest.restoreAllMocks());
 
   test("uses consumerOpts() builder — not consumers.get().consume()", async () => {
     // Register a fake event handler
@@ -225,9 +184,7 @@ describe("NatsTransportStrategy — subscribeToEventPatterns", () => {
 
     await strategy.subscribeToEventPatterns(jsClient, jsm);
 
-    // consumerOpts() must have been called (nats 2.4.x approach)
     expect(nats.consumerOpts).toHaveBeenCalled();
-    // The new simplified API (consumers.get) must NOT be present on JetStreamClient
     expect(jsClient.consumers).toBeUndefined();
   });
 
@@ -236,7 +193,7 @@ describe("NatsTransportStrategy — subscribeToEventPatterns", () => {
 
     await strategy.subscribeToEventPatterns(jsClient, jsm);
 
-    expect(jsClient.subscribe).toHaveBeenCalledWith("orders.created", consumerOptsBuilder);
+    expect(jsClient.subscribe).toHaveBeenCalledWith("orders.created", expect.objectContaining({ getOpts: expect.any(Function) }));
   });
 
   test("sets a default durable name from the pattern", async () => {
@@ -244,9 +201,10 @@ describe("NatsTransportStrategy — subscribeToEventPatterns", () => {
 
     await strategy.subscribeToEventPatterns(jsClient, jsm);
 
-    // durable() should have been called on the builder
-    expect(consumerOptsBuilder._calls.durable).toBeDefined();
-    expect(consumerOptsBuilder._calls.durable).toBe("subscriber-orders-created");
+    const options = jsClient.subscribe.mock.calls[0][1].getOpts();
+    expect(options.config.durable_name).toBe("subscriber-orders-created");
+    expect(options.config.deliver_subject).toMatch(/^_INBOX\./);
+    expect(options.mack).toBe(true);
   });
 
   test("uses durable_name from consumer config callback", async () => {
@@ -255,40 +213,60 @@ describe("NatsTransportStrategy — subscribeToEventPatterns", () => {
     });
     strategy.messageHandlers.set("orders.created", { isEventHandler: true, callback: jest.fn() });
 
-    // Re-spy after re-creating strategy
-    jest.spyOn(nats, "consumerOpts").mockReturnValue(consumerOptsBuilder);
     jsClient = makeJetStreamClient();
     jsm = makeJetStreamManager();
 
     await strategy.subscribeToEventPatterns(jsClient, jsm);
 
-    expect(consumerOptsBuilder._calls.durable).toBe("my-durable-orders-created");
+    expect(jsClient.subscribe.mock.calls[0][1].getOpts().config.durable_name).toBe("my-durable-orders-created");
   });
 
   test("applies queue group via consumerOpts.queue()", async () => {
     strategy = new NatsTransportStrategy({ queue: "my-group" });
     strategy.messageHandlers.set("orders.created", { isEventHandler: true, callback: jest.fn() });
 
-    jest.spyOn(nats, "consumerOpts").mockReturnValue(consumerOptsBuilder);
     jsClient = makeJetStreamClient();
     jsm = makeJetStreamManager();
 
     await strategy.subscribeToEventPatterns(jsClient, jsm);
 
-    expect(consumerOptsBuilder._calls.queue).toBe("my-group");
+    const options = jsClient.subscribe.mock.calls[0][1].getOpts();
+    expect(options.queue).toBe("my-group");
+    expect(options.config.deliver_group).toBe("my-group");
+  });
+
+  test("passes consumer config overrides to the real builder", async () => {
+    strategy = new NatsTransportStrategy({
+      consumer: (config) => {
+        config.max_deliver = 5;
+        config.ack_wait = nats.nanos(30000);
+        config.deliver_policy = nats.DeliverPolicy.New;
+        config.deliver_group = "workers";
+      },
+    });
+    strategy.messageHandlers.set("orders.created", { isEventHandler: true });
+
+    await strategy.subscribeToEventPatterns(jsClient, jsm);
+
+    const options = jsClient.subscribe.mock.calls[0][1].getOpts();
+    expect(options.config).toEqual(expect.objectContaining({
+      max_deliver: 5,
+      ack_wait: nats.nanos(30000),
+      deliver_policy: nats.DeliverPolicy.New,
+      deliver_group: "workers",
+    }));
+    expect(options.queue).toBe("workers");
   });
 
   test("throws descriptive error when stream does not match subject", async () => {
     jsClient.subscribe.mockRejectedValue(new Error("no stream matches subject"));
     strategy.messageHandlers.set("orphan.event", { isEventHandler: true, callback: jest.fn() });
 
-    jest.spyOn(nats, "consumerOpts").mockReturnValue(consumerOptsBuilder);
-
     await expect(strategy.subscribeToEventPatterns(jsClient, jsm))
       .rejects.toThrow("Cannot find stream with the orphan.event event pattern");
   });
 
-  test("does NOT call consumers.get() — absent in nats 2.4.x", async () => {
+  test("uses the push subscription API", async () => {
     strategy.messageHandlers.set("orders.created", { isEventHandler: true, callback: jest.fn() });
 
     await strategy.subscribeToEventPatterns(jsClient, jsm);
@@ -349,7 +327,7 @@ describe("NatsTransportStrategy — subscribeToMessagePatterns", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. NatsTransportStrategy — upsertStream (nats 2.4.x StreamAPI.update signature)
+// 6. NatsTransportStrategy — upsertStream
 // ---------------------------------------------------------------------------
 
 describe("NatsTransportStrategy — upsertStream", () => {
@@ -357,19 +335,17 @@ describe("NatsTransportStrategy — upsertStream", () => {
 
   beforeEach(() => { strategy = new NatsTransportStrategy(); });
 
-  test("calls streams.update(mergedConfig) with ONE argument when stream exists", async () => {
+  test("calls streams.update(name, mergedConfig) when stream exists", async () => {
     const existingConfig = { name: "orders-events", subjects: ["orders.*"], max_msgs: 100 };
     const jsm = makeJetStreamManager();
     jsm.streams.info.mockResolvedValue({ config: existingConfig });
 
     await strategy.upsertStream(jsm, { name: "orders-events", subjects: ["orders.created"] });
 
-    // nats 2.4.x: update() receives only the merged config object — NOT (name, config)
     expect(jsm.streams.update).toHaveBeenCalledTimes(1);
     const [firstArg, secondArg] = jsm.streams.update.mock.calls[0];
-    expect(typeof firstArg).toBe("object"); // merged StreamConfig
-    expect(secondArg).toBeUndefined();       // no second arg (name)
-    expect(firstArg.name).toBe("orders-events");
+    expect(firstArg).toBe("orders-events");
+    expect(secondArg.name).toBe("orders-events");
   });
 
   test("merges existing stream config with new config on update", async () => {
@@ -378,7 +354,7 @@ describe("NatsTransportStrategy — upsertStream", () => {
 
     await strategy.upsertStream(jsm, { name: "orders-events", subjects: ["orders.created"] });
 
-    const [mergedConfig] = jsm.streams.update.mock.calls[0];
+    const [, mergedConfig] = jsm.streams.update.mock.calls[0];
     expect(mergedConfig.max_msgs).toBe(500);               // kept from existing
     expect(mergedConfig.subjects).toEqual(["orders.created"]); // applied from new
   });
@@ -490,10 +466,10 @@ describe("NatsTransportStrategy — handleJetStreamMessage", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8. NatsTransportStrategy — handleStatusUpdates (all nats 2.4.x status types)
+// 8. NatsTransportStrategy — handleStatusUpdates
 // ---------------------------------------------------------------------------
 
-describe("NatsTransportStrategy — handleStatusUpdates — nats 2.4.x status types", () => {
+describe("NatsTransportStrategy — handleStatusUpdates", () => {
   let strategy;
 
   beforeEach(() => { strategy = new NatsTransportStrategy(); });
@@ -506,24 +482,24 @@ describe("NatsTransportStrategy — handleStatusUpdates — nats 2.4.x status ty
     await strategy.handleStatusUpdates(conn);
   }
 
-  // Events enum values (nats@2.4.x)
+  // Events enum values
   test("logs error on 'disconnect'",      async () => { await emitStatus("disconnect");      expect(strategy.logger.error).toHaveBeenCalled(); });
   test("logs error on 'error'",           async () => { await emitStatus("error");           expect(strategy.logger.error).toHaveBeenCalled(); });
   test("logs info on 'reconnect'",        async () => { await emitStatus("reconnect");        expect(strategy.logger.log).toHaveBeenCalled(); });
   test("logs warn on 'ldm'",             async () => { await emitStatus("ldm");             expect(strategy.logger.warn).toHaveBeenCalled(); });
   test("logs verbose on 'update'",        async () => { await emitStatus("update", { server: {} }); expect(strategy.logger.verbose).toHaveBeenCalled(); });
 
-  // DebugEvents enum values (nats@2.4.x)
+  // DebugEvents enum values
   test("logs debug on 'pingTimer'",       async () => { await emitStatus("pingTimer");       expect(strategy.logger.debug).toHaveBeenCalled(); });
   test("logs debug on 'reconnecting'",    async () => { await emitStatus("reconnecting");    expect(strategy.logger.debug).toHaveBeenCalled(); });
   test("logs debug on 'staleConnection'", async () => { await emitStatus("staleConnection"); expect(strategy.logger.debug).toHaveBeenCalled(); });
 });
 
 // ---------------------------------------------------------------------------
-// 9. nats@2.4.x API surface — verify required exports exist
+// 9. nats@2.29.3 API surface — verify required exports exist
 // ---------------------------------------------------------------------------
 
-describe("nats@2.4.x — required API surface", () => {
+describe("nats@2.29.3 — required API surface", () => {
   test("connect is exported", () => {
     expect(typeof nats.connect).toBe("function");
   });
@@ -538,7 +514,6 @@ describe("nats@2.4.x — required API surface", () => {
   test("consumerOpts() factory is exported and returns a builder", () => {
     expect(typeof nats.consumerOpts).toBe("function");
     const builder = nats.consumerOpts();
-    // Verify key builder methods exist in nats 2.4.x
     expect(typeof builder.durable).toBe("function");
     expect(typeof builder.ackExplicit).toBe("function");
     expect(typeof builder.replayOriginal).toBe("function");
@@ -582,12 +557,8 @@ describe("nats@2.4.x — required API surface", () => {
     expect(nats.DebugEvents.StaleConnection).toBe("staleConnection");
   });
 
-  test("ConsumerOptsBuilder does NOT have consumers.get (simplified API — added in 2.17+)", () => {
-    // JetStreamClient in nats 2.4.x has no .consumers property
-    // We verify this by checking the type definitions indirectly:
-    // consumerOpts() builder should NOT have a 'get' method
-    const builder = nats.consumerOpts();
-    expect(builder.get).toBeUndefined();
+  test("consumerOpts accepts a consumer config", () => {
+    expect(realNats.consumerOpts({ max_deliver: 5 }).getOpts().config.max_deliver).toBe(5);
   });
 });
 

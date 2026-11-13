@@ -135,32 +135,24 @@ class NatsTransportStrategy extends microservices_1.Server {
         return tslib_1.__awaiter(this, void 0, void 0, function* () {
             const eventHandlers = [...this.messageHandlers.entries()].filter(([, handler]) => handler.isEventHandler);
             for (const [pattern, handler] of eventHandlers) {
-                // Build consumer options using ConsumerOptsBuilder (nats 2.4.x API)
-                const consumerOptions = nats_1.consumerOpts();
-                consumerOptions.ackExplicit();
-                consumerOptions.replayOriginal();
-                consumerOptions.manualAck();
-                consumerOptions.deliverAll();
-                // Apply user-supplied consumer config overrides
                 const consumerConfig = {
                     ack_policy: nats_1.AckPolicy.Explicit,
                     replay_policy: nats_1.ReplayPolicy.Original,
+                    deliver_policy: nats_1.DeliverPolicy.All,
                 };
                 if (this.options.consumer) {
                     this.options.consumer(consumerConfig);
                 }
-                // Map durable_name from config to the builder
-                if (consumerConfig.durable_name) {
-                    const durableName = this.createDurableName(consumerConfig.durable_name, pattern);
-                    consumerOptions.durable(durableName);
+                const durableName = this.createDurableName(consumerConfig.durable_name || "subscriber", pattern);
+                const consumerOptions = nats_1.consumerOpts(consumerConfig);
+                consumerOptions.manualAck();
+                consumerOptions.durable(durableName);
+                if (!consumerConfig.deliver_subject) {
+                    consumerOptions.deliverTo(nats_1.createInbox());
                 }
-                else {
-                    // Default ephemeral durable name derived from pattern
-                    consumerOptions.durable(this.createDurableName("subscriber", pattern));
-                }
-                // Apply queue group if configured
-                if (this.options.queue) {
-                    consumerOptions.queue(this.options.queue);
+                const queue = this.options.queue || consumerConfig.deliver_group;
+                if (queue) {
+                    consumerOptions.queue(queue);
                 }
                 consumerOptions.callback((error, message) => {
                     if (error) {
@@ -205,8 +197,7 @@ class NatsTransportStrategy extends microservices_1.Server {
         return tslib_1.__awaiter(this, void 0, void 0, function* () {
             try {
                 const stream = yield manager.streams.info(config.name);
-                // nats 2.4.x: streams.update takes only the merged StreamConfig (no stream-name as first arg)
-                const updated = yield manager.streams.update(Object.assign(Object.assign({}, stream.config), config));
+                const updated = yield manager.streams.update(config.name, Object.assign(Object.assign({}, stream.config), config));
                 return updated;
             }
             catch (error) {

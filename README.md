@@ -16,10 +16,10 @@ A NATS transporter for NestJS that takes advantage of [JetStream](https://docs.n
 ## Installation
 
 ```bash
-$ npm install @alexy4744/nestjs-nats-jetstream-transporter nats@2.2.0
+$ npm install @alexy4744/nestjs-nats-jetstream-transporter nats@2.29.3
 ```
 
-⚠️ This library uses [NATS.js](https://github.com/nats-io/nats.js#jetstream), which means that the underlying JetStream API is subject to change and does not follow semver. It is recommended to use `nats@2.2.0` until the JetStream API is out of beta as it has been fully tested with this package.
+Node.js 14 or newer and a NATS server with JetStream enabled are required. The `nats` peer dependency is `^2.29.3`. See the [migration guide](./MIGRATION.md) before upgrading an existing deployment. NATS.js has deprecated the `nats` package in favor of its newer modular packages; this transporter currently uses the 2.x `nats` package.
 
 ## Publishing Messages
 
@@ -28,7 +28,7 @@ The `NatsClient` works mostly the same with the built-in NATS transporter for Ne
 ### Request-Reply
 ```ts
 // main.ts
-import { NatsTransportStrategy } from "nestjs-nats-jetstream-transporter";
+import { NatsTransportStrategy } from "@alexy4744/nestjs-nats-jetstream-transporter";
 
 const app = await NestFactory.createMicroservice(AppModule, {
   strategy: new NatsTransportStrategy()
@@ -39,7 +39,7 @@ await app.listenAsync();
 
 ```ts
 // math.controller.ts
-import { NatsClient } from "nestjs-nats-jetstream-transporter";
+import { NatsClient } from "@alexy4744/nestjs-nats-jetstream-transporter";
 
 @Controller()
 export class MathController {
@@ -54,7 +54,7 @@ export class MathController {
 ### Event-Based
 ```ts
 // main.ts
-import { NatsTransportStrategy } from "nestjs-nats-jetstream-transporter";
+import { NatsTransportStrategy } from "@alexy4744/nestjs-nats-jetstream-transporter";
 
 const app = await NestFactory.createMicroservice(AppModule, {
   strategy: new NatsTransportStrategy({
@@ -74,7 +74,7 @@ await app.listenAsync();
 
 ```ts
 // orders.controller.ts
-import { NatsClient } from "nestjs-nats-jetstream-transporter";
+import { NatsClient } from "@alexy4744/nestjs-nats-jetstream-transporter";
 
 @Controller()
 export class OrdersController {
@@ -98,25 +98,25 @@ There are no special changes needed to receive messages. Just use the `@EventPat
 
 ### Customizing JetStream consumer options
 
-You can customize how the JetStream push consumer behaves. One example is making the consumer durable to survive application restarts. Another example is taking advantage of distributed queues for horozontal scaling.
+You can customize the JetStream push consumer using a `Partial<ConsumerConfig>`. Each event pattern uses a durable consumer; the default name is derived from the pattern. A configured `durable_name` is used as a prefix and the pattern is appended.
 
-Read more about JetStream consumers [here](https://docs.nats.io/jetstream/concepts/consumers), and refer to the underlying API [here](https://github.com/nats-io/nats.deno/blob/main/nats-base-client/types.ts#L330).
+Read more about [JetStream consumers](https://docs.nats.io/jetstream/concepts/consumers). Time-based `ConsumerConfig` fields such as `ack_wait` are in nanoseconds.
 
 ```ts
+import { nanos } from "nats";
+
 const app = await NestFactory.createMicroservice(AppModule, {
   strategy: new NatsTransportStrategy({
     consumer: (options) => {
-      options.durable("my-durable-name");
-
-      // When using a queue group with JetStream, it is necessary that deliverTo() and queue() uses the same name.
-      // This is a requirement for NATS.js v2.2.0, see this issue for more details:
-      // https://github.com/nats-io/nats.js/issues/446
-      options.deliverTo("my-queue-group");
-      options.queue("my-queue-group");
+      options.durable_name = "my-service";
+      options.max_deliver = 5;
+      options.ack_wait = nanos(30_000);
     }
   })
 });
 ```
+
+The transporter uses explicit acknowledgements, original replay, and delivery of all messages by default. Configuration is applied when a consumer is created; an existing durable retains its server-side configuration. See the [migration guide](./MIGRATION.md) for deployment considerations.
 
 ### NACK and TERM JetStream messages
 
@@ -126,7 +126,7 @@ Returning `NACK` will ask for the message to be redelivered, while `TERM` will t
 
 ```ts
 // shipping.controller.ts
-import { NACK, TERM } from "nestjs-nats-jetstream-transporter";
+import { NACK, TERM } from "@alexy4744/nestjs-nats-jetstream-transporter";
 
 @Controller()
 export class ShippingController {
@@ -174,47 +174,14 @@ const app = await NestFactory.createMicroservice(AppModule, {
 });
 ```
 
-If you want to enable this functionality for event patterns, you must also specify the queue group name using the JetStream consumer options builder.
-
-```ts
-const app = await NestFactory.createMicroservice(AppModule, {
-  strategy: new NatsTransportStrategy({
-    consumer: (options) => {
-      // When using a queue group with JetStream, it is necessary that deliverTo() and queue() uses the same name.
-      // This is a requirement for NATS.js v2.2.0, see this issue for more details:
-      // https://github.com/nats-io/nats.js/issues/446
-      options.deliverTo("my-queue-group");
-      options.queue("my-queue-group")
-    },
-    queue: "my-queue-group"
-  })
-});
-```
+The top-level `queue` applies to both request-reply and JetStream event subscriptions. For event subscriptions, `consumer` may instead set `deliver_group`; the top-level `queue` takes precedence when both are set. Instances sharing a durable consumer must use the same queue group.
 
 ## Development
 
 ```bash
-# Run tests
-$ nx test nestjs-nats-jetstream-transporter
+# Run unit tests
+$ npm test
 ```
 
-```bash
-# Update version
-$ nx version nestjs-nats-jetstream-transporter
-```
-
-```bash
-# Build the project
-$ nx build nestjs-nats-jetstream-transporter
-```
-
-```bash
-# Publish new version on GitHub
-$ git push --follow-tags origin master
-```
-
-```bash
-# Publish new version on NPM
-$ npm publish ./dist/packages/nestjs-nats-jetstream-transporter --access=public
-```
+To also run the integration test, start a NATS server with JetStream enabled and run `NATS_URL=nats://127.0.0.1:4222 npm test`. The test creates and deletes a uniquely named stream.
 

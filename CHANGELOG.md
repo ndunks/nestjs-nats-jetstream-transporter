@@ -2,6 +2,13 @@
 
 This file was generated using [@jscutlery/semver](https://github.com/jscutlery/semver).
 
+## Unreleased
+
+- Require Node.js 14 or newer and `nats` `^2.29.3`.
+- Fix JetStream stream updates and push consumer creation for NATS.js 2.29.3.
+- Apply consumer configuration fields when creating a consumer; existing durables retain their server-side configuration.
+- See [MIGRATION.md](./MIGRATION.md) for upgrade and consumer migration guidance.
+
 ## [1.0.9] — nats peer dependency upgrade to `^2.4.0`
 
 ### ⚠️ Breaking Changes

@@ -10,7 +10,9 @@ export interface NatsTransportStrategyOptions {
      */
     connection?: ConnectionOptions;
     /**
-     * Consumer options for JetStream subscriptions
+    * Configure JetStream push consumers. The durable name is suffixed with the
+    * event pattern; queue takes precedence over deliver_group when both are set.
+    * Configuration changes apply when a consumer is created, not when reusing one.
      * @see https://github.com/nats-io/nats.deno/blob/main/jetstream.md#push-subscriptions
      * @see https://docs.nats.io/jetstream/concepts/consumers
      */
